@@ -1,5 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stylo Fibra</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.9/dist/umd/supabase.js"></script>
 <style>
   :root{
     --bg:#E8E2CE;
@@ -414,6 +418,110 @@
     });
   }
 
+  // ---------------- Supabase (backend real fora do Claude) ----------------
+  var SUPABASE_URL = "https://ychrisppqnruiyowkjdu.supabase.co";
+  var SUPABASE_ANON_KEY = "sb_publishable_tfT9Q-gWzWKHKaeQxxPJiQ_Dz1b36zw";
+  var SUPABASE_TABLE = "documents";
+  var SUPABASE_BUCKET = "uploads";
+
+  // Adapta o cliente supabase-js pra ter a mesma "forma" da capacidade
+  // window.claude.use("db") que o resto do sistema já usa — assim docSet/docUpdate/
+  // docDelete/subscribeCollection não precisam mudar nada.
+  function makeSupabaseDb(client){
+    var listeners = {}; // col -> {cb, errCb, timer}
+
+    function fetchCollection(col){
+      return client.from(SUPABASE_TABLE).select("doc_id,data").eq("collection", col)
+        .then(function(res){
+          if (res.error) throw res.error;
+          return res.data || [];
+        });
+    }
+    function notify(col){
+      var l = listeners[col];
+      if (!l) return Promise.resolve();
+      return fetchCollection(col).then(function(rows){
+        // Formato compatível com o snapshot do Firestore que subscribeCollection já espera
+        // (snap.docs.forEach(d => d.id / d.data())), assim não precisamos mexer nessa função.
+        var docs = rows.map(function(r){
+          return { id: r.doc_id, data: function(){ return r.data; } };
+        });
+        l.cb({ docs: docs });
+      }).catch(function(err){
+        console.error("supabase fetch error on "+col, err);
+        if (l.errCb) l.errCb(err);
+      });
+    }
+    function upsertDoc(col, id, data){
+      return client.from(SUPABASE_TABLE)
+        .upsert({collection:col, doc_id:id, data:data, updated_at:new Date().toISOString()}, {onConflict:"collection,doc_id"})
+        .then(function(res){ if (res.error) throw res.error; return notify(col); });
+    }
+
+    return {
+      collection: function(col){
+        return {
+          doc: function(id){
+            return {
+              set: function(data){ return upsertDoc(col, id, data); },
+              update: function(data){
+                return client.from(SUPABASE_TABLE).select("data").eq("collection", col).eq("doc_id", id).maybeSingle()
+                  .then(function(res){
+                    if (res.error) throw res.error;
+                    var merged = Object.assign({}, (res.data && res.data.data) || {}, data);
+                    return upsertDoc(col, id, merged);
+                  });
+              },
+              delete: function(){
+                return client.from(SUPABASE_TABLE).delete().eq("collection", col).eq("doc_id", id)
+                  .then(function(res){ if (res.error) throw res.error; return notify(col); });
+              }
+            };
+          },
+          onSnapshot: function(cb, errCb){
+            listeners[col] = {cb:cb, errCb:errCb};
+            notify(col);
+            var timer = setInterval(function(){ notify(col); }, 20000);
+            listeners[col].timer = timer;
+            return function(){ clearInterval(timer); delete listeners[col]; };
+          }
+        };
+      }
+    };
+  }
+
+  function makeSupabaseAssets(client){
+    return {
+      upload: function(file){
+        var ext = (file.name && file.name.lastIndexOf(".") > -1) ? file.name.slice(file.name.lastIndexOf(".")) : "";
+        var path = Date.now()+"-"+Math.random().toString(36).slice(2,8)+ext;
+        return client.storage.from(SUPABASE_BUCKET).upload(path, file, {upsert:false})
+          .then(function(res){
+            if (res.error) throw res.error;
+            var pub = client.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
+            return { id: path, url: pub.data.publicUrl };
+          });
+      }
+    };
+  }
+
+  function makeBrowserDownloads(){
+    return {
+      save: function(opts){
+        return new Promise(function(resolve){
+          var blobUrl = URL.createObjectURL(opts.data);
+          var a = document.createElement("a");
+          a.href = blobUrl; a.download = opts.filename || "arquivo";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 4000);
+          resolve({ok:true});
+        });
+      }
+    };
+  }
+
   // ---------------- db plumbing ----------------
   function docSet(col, id, data){
     if (mode === "db") {
@@ -467,25 +575,52 @@
     unsubs.push(unsub);
   }
 
+  var COLLECTIONS = ["leads","campaigns","content","orcamentos","criativos","prompts","settings","logistica","produtos"];
+
   function initDb(){
-    Promise.resolve(window.claude && window.claude.use ? window.claude.use("db") : null)
-      .then(function(handle){
-        if (handle) {
-          db = handle;
-          mode = "db";
-          ["leads","campaigns","content","orcamentos","criativos","prompts","settings","logistica","produtos"].forEach(subscribeCollection);
-        } else {
-          mode = "local";
-        }
+    if (window.claude && window.claude.use) {
+      // Rodando dentro do Claude — usa as capacidades nativas, comportamento original.
+      Promise.resolve(window.claude.use("db"))
+        .then(function(handle){
+          if (handle) {
+            db = handle;
+            mode = "db";
+            COLLECTIONS.forEach(subscribeCollection);
+          } else {
+            mode = "local";
+          }
+          render();
+        })
+        .catch(function(){ mode = "local"; render(); });
+      Promise.resolve(window.claude.use("assets"))
+        .then(function(handle){ assets = handle; render(); })
+        .catch(function(){ assets = null; });
+      Promise.resolve(window.claude.use("downloads"))
+        .then(function(handle){ downloadsCap = handle; render(); })
+        .catch(function(){ downloadsCap = null; });
+      return;
+    }
+
+    if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY) {
+      // Rodando fora do Claude (ex: GitHub Pages) — usa o Supabase como backend real.
+      try {
+        var client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        db = makeSupabaseDb(client);
+        mode = "db";
+        COLLECTIONS.forEach(subscribeCollection);
+        assets = makeSupabaseAssets(client);
+        downloadsCap = makeBrowserDownloads();
         render();
-      })
-      .catch(function(){ mode = "local"; render(); });
-    Promise.resolve(window.claude && window.claude.use ? window.claude.use("assets") : null)
-      .then(function(handle){ assets = handle; render(); })
-      .catch(function(){ assets = null; });
-    Promise.resolve(window.claude && window.claude.use ? window.claude.use("downloads") : null)
-      .then(function(handle){ downloadsCap = handle; render(); })
-      .catch(function(){ downloadsCap = null; });
+      } catch (e) {
+        console.error("Falha ao iniciar o Supabase", e);
+        mode = "local";
+        render();
+      }
+      return;
+    }
+
+    mode = "local";
+    render();
   }
 
   // ================= RENDER =================
@@ -1058,7 +1193,7 @@
       (itensExibir.length ?
         '<div style="display:flex; flex-direction:column; gap:10px;">'+
           itensExibir.map(function(c,i){
-            var thumbSrc = c.imagemId ? '/_blob/'+esc(c.imagemId) : null;
+            var thumbSrc = c.imagemUrl ? c.imagemUrl : (c.imagemId ? '/_blob/'+esc(c.imagemId) : null);
             var temDados = c.cpa || c.taxaConversao;
             return '<div data-id="'+c.id+'" data-action="edit-criativo-painel" style="display:flex; align-items:center; gap:10px; cursor:pointer;">'+
               (usandoRanking ? '<span style="font-weight:700; color:var(--accent-2); width:16px; flex:none;">#'+(i+1)+'</span>' : '')+
@@ -1087,7 +1222,7 @@
       '</div>'+
       (produtoExibir ?
         (function(){
-          var thumbSrc = produtoExibir.imagemId ? '/_blob/'+esc(produtoExibir.imagemId) : (produtoExibir.imagemUrl ? produtoExibir.imagemUrl : null);
+          var thumbSrc = produtoExibir.imagemUrl ? produtoExibir.imagemUrl : (produtoExibir.imagemId ? '/_blob/'+esc(produtoExibir.imagemId) : null);
           var thumb = thumbSrc ? '<img src="'+thumbSrc+'" style="width:40px;height:40px;object-fit:cover;border-radius:8px;border:1px solid var(--border); flex:none;">' : '<div style="width:40px;height:40px;border-radius:8px;background:var(--surface-2); flex:none;"></div>';
           var subtitulo = produtoTop ?
             (produtoExibir.vendas+' venda'+(produtoExibir.vendas===1?"":"s")+' · '+fmtBRL(produtoExibir.receita)+' em receita'+(temMargemPainel?' · '+fmtBRL(produtoExibir.lucroEstimado)+' lucro est.':'')) :
@@ -1214,7 +1349,7 @@
   function renderCriativos(){
     var criativos = sortByField(Array.from(state.criativos.values()), "criadoEm", "desc");
     var galleryHtml = criativos.length ? '<div class="gallery-grid">'+criativos.map(function(c){
-      var thumbSrc = c.imagemId ? '/_blob/'+esc(c.imagemId) : (c.imagemUrl ? c.imagemUrl : null);
+      var thumbSrc = c.imagemUrl ? c.imagemUrl : (c.imagemId ? '/_blob/'+esc(c.imagemId) : null);
       var thumb = thumbSrc ? '<img class="thumb" src="'+thumbSrc+'" alt="">' : '<div class="thumb-empty">sem imagem</div>';
       var statusCores = {ativo:"var(--st-fechado)", pausado:"var(--st-morno)", vencido:"var(--st-quente)"};
       var statusLabels = {ativo:"Ativo", pausado:"Pausado", vencido:"Vencido"};
@@ -1349,7 +1484,10 @@
         status: document.getElementById("cvStatus").value,
         dataVeiculacao: document.getElementById("cvData").value
       };
-      if (criativoDraftImg) data.imagemId = criativoDraftImg.id;
+      if (criativoDraftImg) {
+        if (criativoDraftImg.id) data.imagemId = criativoDraftImg.id;
+        if (/^https?:/.test(criativoDraftImg.url||"")) data.imagemUrl = criativoDraftImg.url;
+      }
       docAdd("criativos", data).then(function(){
         criativoDraftImg = null;
         showToast("Criativo salvo.");
@@ -1387,7 +1525,7 @@
 
   function criativoEditFormHtml(c){
     c = c || {};
-    criativoEditDraftImg = c.imagemId ? {id: c.imagemId, url: "/_blob/"+c.imagemId} : null;
+    criativoEditDraftImg = c.imagemUrl ? {id: c.imagemId||null, url: c.imagemUrl} : (c.imagemId ? {id: c.imagemId, url: "/_blob/"+c.imagemId} : null);
     var uploadUi = assets ?
       ('<div class="field"><label>Imagem</label>'+
         '<div style="display:flex; align-items:center; gap:10px;">'+
@@ -1456,7 +1594,10 @@
         status: document.getElementById("cveStatus").value,
         dataVeiculacao: document.getElementById("cveData").value
       };
-      if (criativoEditDraftImg) data.imagemId = criativoEditDraftImg.id;
+      if (criativoEditDraftImg) {
+        if (criativoEditDraftImg.id) data.imagemId = criativoEditDraftImg.id;
+        if (/^https?:/.test(criativoEditDraftImg.url||"")) data.imagemUrl = criativoEditDraftImg.url;
+      }
       docUpdate("criativos", c.id, data).then(function(){ showToast("Criativo atualizado."); closeModal(); });
     });
   }
@@ -1525,7 +1666,7 @@
     var rows = statsOrdenados.length ? statsOrdenados.map(function(p){
       var preco = p.precoMin || p.precoMax || 0;
       var faixaCor = FAIXA_COR[p.faixa] || "var(--muted)";
-      var thumbSrc = p.imagemId ? '/_blob/'+esc(p.imagemId) : (p.imagemUrl ? p.imagemUrl : null);
+      var thumbSrc = p.imagemUrl ? p.imagemUrl : (p.imagemId ? '/_blob/'+esc(p.imagemId) : null);
       var thumb = thumbSrc ? '<img src="'+thumbSrc+'" style="width:36px;height:36px;object-fit:cover;border-radius:7px;border:1px solid var(--border); flex:none;">' : '<div style="width:36px;height:36px;border-radius:7px;background:var(--surface-2); flex:none;"></div>';
       return '<tr data-id="'+p.id+'" data-action="edit-produto" style="cursor:pointer;">'+
         '<td><div style="display:flex; gap:9px; align-items:center;">'+thumb+'<div><b>'+esc(p.nome)+'</b>'+(p.composicao?'<div style="font-size:11px; color:var(--muted);">'+esc(p.composicao)+(p.pecas?' · '+esc(p.pecas)+' peças':'')+'</div>':'')+'</div></div></td>'+
@@ -1540,7 +1681,7 @@
     }).join("") : '<tr><td colspan="8"><div class="empty-state">Nenhum produto cadastrado ainda — adiciona seu catálogo (kits/faixa de preço) pra cruzar com as vendas fechadas.</div></td></tr>';
 
     var destaque = ranked.length && ranked[0][rankKey]>0 ? ranked[0] : null;
-    var destaqueThumbSrc = destaque && destaque.imagemId ? '/_blob/'+esc(destaque.imagemId) : (destaque && destaque.imagemUrl ? destaque.imagemUrl : null);
+    var destaqueThumbSrc = destaque && destaque.imagemUrl ? destaque.imagemUrl : (destaque && destaque.imagemId ? '/_blob/'+esc(destaque.imagemId) : null);
     var destaqueThumb = destaqueThumbSrc ?
       '<img src="'+destaqueThumbSrc+'" style="width:44px;height:44px;object-fit:cover;border-radius:9px;border:1px solid var(--border); flex:none;">' :
       '<div style="width:44px;height:44px;border-radius:9px;background:var(--surface-2); flex:none;"></div>';
@@ -1572,7 +1713,7 @@
 
   function produtoFormHtml(p){
     p = p || {};
-    produtoDraftImg = p.imagemId ? {id: p.imagemId, url: "/_blob/"+p.imagemId} : (p.imagemUrl ? {id:null, url:p.imagemUrl} : null);
+    produtoDraftImg = p.imagemUrl ? {id: p.imagemId||null, url: p.imagemUrl} : (p.imagemId ? {id: p.imagemId, url: "/_blob/"+p.imagemId} : null);
     var uploadUi = assets ?
       ('<div class="field"><label>Foto do produto</label>'+
         '<div style="display:flex; align-items:center; gap:10px;">'+
@@ -1645,6 +1786,7 @@
       };
       if (!data.nome) { showToast("Coloca o nome do produto."); return; }
       if (produtoDraftImg && produtoDraftImg.id) data.imagemId = produtoDraftImg.id;
+      if (produtoDraftImg && /^https?:/.test(produtoDraftImg.url||"")) data.imagemUrl = produtoDraftImg.url;
       if (p && p.id) {
         docUpdate("produtos", p.id, data).then(function(){ showToast("Produto atualizado."); closeModal(); });
       } else {
@@ -2115,7 +2257,8 @@
       '</div>';
 
     var histHtml = orcs.length ? orcs.map(function(o){
-      var thumb = o.fotoId ? '<img src="/_blob/'+esc(o.fotoId)+'" style="width:34px;height:34px;object-fit:cover;border-radius:7px;border:1px solid var(--border);margin-right:8px;">' : "";
+      var oFotoSrc = o.fotoUrl ? o.fotoUrl : (o.fotoId ? '/_blob/'+esc(o.fotoId) : null);
+      var thumb = oFotoSrc ? '<img src="'+esc(oFotoSrc)+'" style="width:34px;height:34px;object-fit:cover;border-radius:7px;border:1px solid var(--border);margin-right:8px;">' : "";
       return '<div class="card" style="padding:12px 14px; margin-bottom:10px;">'+
         '<div style="display:flex; justify-content:space-between; gap:10px;">'+
           '<div style="display:flex; align-items:center;">'+thumb+'<div><b>'+esc(o.clienteNome||"—")+'</b><div style="font-size:12px;color:var(--muted)">'+fmtDate((o.criadoEm||"").slice(0,10))+'</div></div></div>'+
@@ -2213,7 +2356,10 @@
         obs: orcDraft.obs||"",
         criadoEm: new Date().toISOString()
       };
-      if (orcDraftImg) payload.fotoId = orcDraftImg.id;
+      if (orcDraftImg) {
+        if (orcDraftImg.id) payload.fotoId = orcDraftImg.id;
+        if (/^https?:/.test(orcDraftImg.url||"")) payload.fotoUrl = orcDraftImg.url;
+      }
       payload.textoGerado = generateOrcamentoText(payload);
       docAdd("orcamentos", payload).then(function(){
         orcDraft = { itens:[{desc:"",valor:""}] };
@@ -2539,8 +2685,9 @@
     showToast("Gerando PDF...");
     var payload = Object.assign({}, o);
     var prep = Promise.resolve();
-    if (o.fotoId) {
-      prep = prep.then(function(){ return fetchAsDataUrl("/_blob/"+o.fotoId); })
+    var _fotoSrcForPdf = o.fotoUrl ? o.fotoUrl : (o.fotoId ? "/_blob/"+o.fotoId : null);
+    if (_fotoSrcForPdf) {
+      prep = prep.then(function(){ return fetchAsDataUrl(_fotoSrcForPdf); })
         .then(function(durl){ payload._fotoDataUrl = durl; })
         .catch(function(err){ console.error("foto não carregou pro PDF", err); });
     }
@@ -2658,8 +2805,9 @@
     var items = sortByField(Array.from(state.content.values()), "data", "asc");
     var rows = items.length ? items.map(function(it){
       var done = it.status === "postado";
-      var thumb = it.imagemId ?
-        '<img src="/_blob/'+esc(it.imagemId)+'" alt="" style="width:40px;height:40px;object-fit:cover;border-radius:7px;border:1px solid var(--border);">' :
+      var itThumbSrc = it.imagemUrl ? it.imagemUrl : (it.imagemId ? '/_blob/'+esc(it.imagemId) : null);
+      var thumb = itThumbSrc ?
+        '<img src="'+esc(itThumbSrc)+'" alt="" style="width:40px;height:40px;object-fit:cover;border-radius:7px;border:1px solid var(--border);">' :
         '<div style="width:40px;height:40px;border-radius:7px;background:var(--surface-2);border:1px dashed var(--border);"></div>';
       return '<tr>'+
         '<td>'+thumb+'</td>'+
@@ -2687,7 +2835,7 @@
 
   function contentFormHtml(it){
     it = it || {};
-    contentDraftImg = it.imagemId ? {id: it.imagemId, url: "/_blob/"+it.imagemId} : null;
+    contentDraftImg = it.imagemUrl ? {id: it.imagemId||null, url: it.imagemUrl} : (it.imagemId ? {id: it.imagemId, url: "/_blob/"+it.imagemId} : null);
     var tipoOpts = CONTENT_TIPOS.map(function(t){
       return '<option value="'+t+'"'+(it.tipo===t?" selected":"")+'>'+t+'</option>';
     }).join("");
@@ -2754,7 +2902,10 @@
         status: document.getElementById("ctStatus").value,
         nota: document.getElementById("ctNota").value.trim()
       };
-      if (contentDraftImg) data.imagemId = contentDraftImg.id;
+      if (contentDraftImg) {
+        if (contentDraftImg.id) data.imagemId = contentDraftImg.id;
+        if (/^https?:/.test(contentDraftImg.url||"")) data.imagemUrl = contentDraftImg.url;
+      }
       if (it && it.id) {
         docUpdate("content", it.id, data).then(function(){ showToast("Post atualizado."); closeModal(); });
       } else {
