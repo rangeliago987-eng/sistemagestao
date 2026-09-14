@@ -113,6 +113,7 @@
   }
   .topbar h1{font-size:21px; margin:0; text-wrap:balance;}
   .topbar .date{font-size:12.5px; color:var(--muted);}
+  .conn-status{display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600; padding:3px 9px; border-radius:999px; background:var(--surface-2); white-space:nowrap;}
   #view{padding:16px 28px 40px; flex:1;}
 
   .btn{
@@ -286,7 +287,10 @@
   <main>
     <div class="topbar">
       <h1 id="pageTitle">Pipeline</h1>
-      <div class="date" id="pageDate"></div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="conn-status" id="connStatus" style="display:none;"></span>
+        <div class="date" id="pageDate"></div>
+      </div>
     </div>
     <div id="view"></div>
   </main>
@@ -321,6 +325,12 @@
 
   var CONTENT_TIPOS = ["Foto de produto","Depoimento","Bastidor/produção","Promoção","Outro"];
 
+  var MATERIAL_CATEGORIAS = ["Fibra sintética","Ferro galvanizado","Tecido","Espuma/Enchimento","Corda náutica","Outro"];
+  var MATERIAL_COR = {
+    "Fibra sintética":"var(--accent)", "Ferro galvanizado":"var(--st-frio)", "Tecido":"var(--st-posvenda)",
+    "Espuma/Enchimento":"var(--st-morno)", "Corda náutica":"var(--accent-2)", "Outro":"var(--muted)"
+  };
+
   var TABS = [
     {id:"painel", label:"Painel", ico:"◈"},
     {id:"pipeline", label:"Pipeline", ico:"◆"},
@@ -332,6 +342,7 @@
     {id:"clientes", label:"Clientes", ico:"◉"},
     {id:"criativos", label:"Criativos", ico:"◨"},
     {id:"produtos", label:"Mix de produto", ico:"▤"},
+    {id:"materiais", label:"Materiais", ico:"⬡"},
     {id:"calendario", label:"Calendário", ico:"▦"},
     {id:"calculadora", label:"Calculadora", ico:"⊞"},
     {id:"relatorio", label:"Relatório", ico:"▧"},
@@ -373,7 +384,7 @@
   var downloadsCap = null;
   var mode = "loading"; // loading | db | local
   var currentTab = "painel";
-  var state = { leads: new Map(), campaigns: new Map(), content: new Map(), orcamentos: new Map(), criativos: new Map(), prompts: new Map(), settings: new Map(), logistica: new Map(), produtos: new Map() };
+  var state = { leads: new Map(), campaigns: new Map(), content: new Map(), orcamentos: new Map(), criativos: new Map(), prompts: new Map(), settings: new Map(), logistica: new Map(), produtos: new Map(), materiais: new Map() };
   var unsubs = [];
 
   // ---------------- helpers ----------------
@@ -582,12 +593,21 @@
     return docSet(col, id, data).then(function(){ return id; });
   }
 
+  function snapshotKey(m){
+    // Assinatura estável de um Map (ordenada por id) pra saber se os dados
+    // realmente mudaram — evita redesenhar a tela (e apagar o que a pessoa
+    // está digitando) quando o "ping" periódico do Supabase traz os mesmos dados de sempre.
+    var ids = Array.from(m.keys()).sort();
+    return JSON.stringify(ids.map(function(id){ return [id, m.get(id)]; }));
+  }
+
   function subscribeCollection(col){
     var unsub = db.collection(col).onSnapshot(function(snap){
       var m = new Map();
       snap.docs.forEach(function(d){ m.set(d.id, Object.assign({id:d.id}, d.data())); });
+      var mudou = snapshotKey(state[col]) !== snapshotKey(m);
       state[col] = m;
-      render();
+      if (mudou) render();
     }, function(err){
       console.error("db error on "+col, err);
       if (mode === "db") showToast("Conexão com os dados caiu — tenta recarregar.");
@@ -595,7 +615,7 @@
     unsubs.push(unsub);
   }
 
-  var COLLECTIONS = ["leads","campaigns","content","orcamentos","criativos","prompts","settings","logistica","produtos"];
+  var COLLECTIONS = ["leads","campaigns","content","orcamentos","criativos","prompts","settings","logistica","produtos","materiais"];
 
   function initDb(){
     if (window.claude && window.claude.use) {
@@ -643,18 +663,42 @@
     render();
   }
 
+  function updateConnStatus(){
+    var el = document.getElementById("connStatus");
+    if (!el) return;
+    if (window.claude && window.claude.use) { el.style.display = "none"; return; } // dentro do Claude não precisa avisar
+    if (mode === "db") {
+      el.style.display = "inline-flex";
+      el.style.color = "var(--st-fechado)";
+      el.textContent = "● conectado";
+      el.title = "Conectado ao banco de dados — o que você salvar fica guardado de verdade.";
+    } else {
+      el.style.display = "inline-flex";
+      el.style.color = "var(--st-quente)";
+      el.textContent = "⚠ sem conexão com o banco";
+      el.title = "Não consegui conectar ao banco de dados agora — o que você fizer nessa sessão pode não ficar salvo. Recarregue a página ou verifique sua internet.";
+    }
+  }
+
   // ================= RENDER =================
   function render(){
+    updateConnStatus();
     renderNav();
     renderSideSummary();
     document.getElementById("pageDate").textContent =
       new Date().toLocaleDateString("pt-BR",{weekday:"long", day:"2-digit", month:"long"});
-    var titles = {painel:"Painel", pipeline:"Pipeline de vendas", reengajar:"Reengajar leads frios", orcamentos:"Orçamentos", logistica:"Logística de entregas", campanhas:"Campanhas de tráfego", conteudo:"Conteúdo do Instagram", clientes:"Clientes", criativos:"Criativos e prompts", produtos:"Mix de produto", calendario:"Calendário", calculadora:"Calculadora", relatorio:"Relatório", processo:"Processo de vendas"};
+    var titles = {painel:"Painel", pipeline:"Pipeline de vendas", reengajar:"Reengajar leads frios", orcamentos:"Orçamentos", logistica:"Logística de entregas", campanhas:"Campanhas de tráfego", conteudo:"Conteúdo do Instagram", clientes:"Clientes", criativos:"Criativos e prompts", produtos:"Mix de produto", materiais:"Custo de material", calendario:"Calendário", calculadora:"Calculadora", relatorio:"Relatório", processo:"Processo de vendas"};
     document.getElementById("pageTitle").textContent = titles[currentTab];
 
     var view = document.getElementById("view");
     if (mode === "loading") {
       view.innerHTML = '<div class="empty-state">Carregando seus dados…</div>';
+      return;
+    }
+    var focado = document.activeElement;
+    if (focado && view.contains(focado) && /^(INPUT|TEXTAREA|SELECT)$/.test(focado.tagName)) {
+      // A pessoa está digitando em algum campo dessa aba agora — não redesenha
+      // por baixo dela (isso é o que apagava o número no meio da digitação).
       return;
     }
     if (currentTab === "painel") view.innerHTML = renderPainel();
@@ -667,6 +711,7 @@
     else if (currentTab === "clientes") view.innerHTML = renderClientes();
     else if (currentTab === "criativos") view.innerHTML = renderCriativos();
     else if (currentTab === "produtos") view.innerHTML = renderProdutos();
+    else if (currentTab === "materiais") view.innerHTML = renderMateriais();
     else if (currentTab === "calendario") view.innerHTML = renderCalendario();
     else if (currentTab === "calculadora") view.innerHTML = renderCalculadora();
     else if (currentTab === "relatorio") view.innerHTML = renderRelatorio();
@@ -1509,6 +1554,7 @@
         }).catch(function(err){
           console.error(err);
           document.getElementById("cvImgStatus").textContent = "Não deu pra enviar — tenta outra.";
+          showToast("Erro ao enviar imagem"+(err&&err.message?": "+err.message:"")+".");
         });
       });
     }
@@ -1622,6 +1668,7 @@
         }).catch(function(err){
           console.error(err);
           document.getElementById("cveImgStatus").textContent = "Não deu pra enviar — tenta outra.";
+          showToast("Erro ao enviar imagem"+(err&&err.message?": "+err.message:"")+".");
         });
       });
     }
@@ -1811,6 +1858,7 @@
         }).catch(function(err){
           console.error(err);
           document.getElementById("pdImgStatus").textContent = "Não deu pra enviar — tenta outra.";
+          showToast("Erro ao enviar imagem"+(err&&err.message?": "+err.message:"")+".");
         });
       });
     }
@@ -1841,6 +1889,130 @@
     if (btnNovo) btnNovo.addEventListener("click", function(){ openProdutoForm(null); });
     Array.prototype.forEach.call(document.querySelectorAll('[data-action="edit-produto"]'), function(row){
       row.addEventListener("click", function(){ openProdutoForm(state.produtos.get(row.dataset.id)); });
+    });
+  }
+
+  // ---------- Materiais (custo de matéria-prima) ----------
+  function computeMateriaisStats(){
+    var materiais = Array.from(state.materiais.values());
+    var comValor = materiais.map(function(m){
+      var custoUnit = Number(m.custoUnitario)||0;
+      var estoque = Number(m.quantidadeEstoque)||0;
+      return Object.assign({}, m, {valorTotal: custoUnit*estoque});
+    });
+    var porCategoria = {};
+    MATERIAL_CATEGORIAS.forEach(function(cat){ porCategoria[cat] = {categoria:cat, itens:0, valorTotal:0}; });
+    comValor.forEach(function(m){
+      var cat = MATERIAL_CATEGORIAS.indexOf(m.categoria)>=0 ? m.categoria : "Outro";
+      porCategoria[cat].itens += 1;
+      porCategoria[cat].valorTotal += m.valorTotal;
+    });
+    var totalGeral = comValor.reduce(function(s,m){ return s+m.valorTotal; }, 0);
+    return {itens: comValor, porCategoria: porCategoria, totalGeral: totalGeral};
+  }
+
+  function renderMateriais(){
+    var stats = computeMateriaisStats();
+    var itens = sortByField(stats.itens, "categoria", "asc");
+
+    var cardsHtml = MATERIAL_CATEGORIAS.map(function(cat){
+      var c = stats.porCategoria[cat];
+      var cor = MATERIAL_COR[cat] || "var(--muted)";
+      return '<div class="card" style="padding:14px 16px; min-width:150px; flex:1;">'+
+        '<div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">'+
+          '<span style="width:8px;height:8px;border-radius:50%;background:'+cor+';"></span>'+
+          '<span style="font-size:11.5px; color:var(--muted);">'+cat+'</span>'+
+        '</div>'+
+        '<div style="font-size:19px; font-weight:700;">'+fmtBRL(c.valorTotal)+'</div>'+
+        '<div style="font-size:11px; color:var(--muted); margin-top:2px;">'+c.itens+' item'+(c.itens===1?"":"s")+'</div>'+
+      '</div>';
+    }).join("");
+
+    var rows = itens.length ? itens.map(function(m){
+      var cor = MATERIAL_COR[m.categoria] || "var(--muted)";
+      return '<tr data-id="'+m.id+'" data-action="edit-material" style="cursor:pointer;">'+
+        '<td><b>'+esc(m.nome)+'</b>'+(m.fornecedor?'<div style="font-size:11px; color:var(--muted);">'+esc(m.fornecedor)+'</div>':'')+'</td>'+
+        '<td><span class="pill" style="background:'+cor+'22; color:'+cor+';">'+esc(m.categoria)+'</span></td>'+
+        '<td class="num">'+(m.custoUnitario?fmtBRL(m.custoUnitario):"—")+(m.unidade?' / '+esc(m.unidade):'')+'</td>'+
+        '<td class="num">'+(m.quantidadeEstoque!=null && m.quantidadeEstoque!==""?m.quantidadeEstoque:"—")+'</td>'+
+        '<td class="num">'+(m.valorTotal?fmtBRL(m.valorTotal):"—")+'</td>'+
+        '</tr>';
+    }).join("") : '<tr><td colspan="5"><div class="empty-state">Nenhum material cadastrado ainda — cadastra fibra, ferro, tecido, espuma... com o custo de cada um pra eu somar aqui.</div></td></tr>';
+
+    return '<p style="margin:0 0 16px; font-size:13px; color:var(--muted); max-width:70ch;">Registra o custo de cada matéria-prima (fibra sintética, ferro galvanizado, tecido, espuma, corda náutica...) — eu somo tudo por categoria e no total geral, pra te ajudar a enxergar o custo de material e analisar sua margem.</p>'+
+      '<div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;">'+cardsHtml+'</div>'+
+      '<div class="card" style="padding:14px 16px; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; border-left:4px solid var(--accent);">'+
+        '<span style="font-size:13px; color:var(--muted);">Total investido em material (estoque cadastrado)</span>'+
+        '<span style="font-size:20px; font-weight:700;">'+fmtBRL(stats.totalGeral)+'</span>'+
+      '</div>'+
+      '<div class="pipeline-head">'+
+        '<div style="color:var(--muted); font-size:13px;">Toque numa linha pra editar.</div>'+
+        '<button class="btn btn-primary" id="btnNovoMaterial">+ Novo material</button>'+
+      '</div>'+
+      '<div class="card" style="overflow-x:auto;">'+
+      '<table><thead><tr><th>Material</th><th>Categoria</th><th>Custo unitário</th><th>Estoque</th><th>Valor total</th></tr></thead>'+
+      '<tbody>'+rows+'</tbody></table></div>';
+  }
+
+  function materialFormHtml(m){
+    m = m || {};
+    var catOpts = MATERIAL_CATEGORIAS.map(function(c){
+      return '<option value="'+c+'"'+(m.categoria===c?" selected":"")+'>'+c+'</option>';
+    }).join("");
+    return (m.id ? '<h3>Editar material</h3>' : '<h3>Novo material</h3>')+
+      '<div class="field"><label>Nome do material</label><input id="mtNome" value="'+esc(m.nome||"")+'" placeholder="Ex: Fibra sintética bege 2mm"></div>'+
+      '<div class="row">'+
+        '<div class="field"><label>Categoria</label><select id="mtCategoria">'+catOpts+'</select></div>'+
+        '<div class="field"><label>Unidade de medida</label><input id="mtUnidade" value="'+esc(m.unidade||"")+'" placeholder="Ex: metro, kg, rolo, unidade"></div>'+
+      '</div>'+
+      '<div class="row">'+
+        '<div class="field"><label>Custo por unidade (R$)</label><input id="mtCusto" type="number" step="0.01" value="'+(m.custoUnitario!=null&&m.custoUnitario!==0?m.custoUnitario:"")+'"></div>'+
+        '<div class="field"><label>Quantidade em estoque (opcional)</label><input id="mtEstoque" type="number" step="0.01" value="'+(m.quantidadeEstoque!=null&&m.quantidadeEstoque!==""?m.quantidadeEstoque:"")+'"></div>'+
+      '</div>'+
+      '<div class="field"><label>Fornecedor (opcional)</label><input id="mtFornecedor" value="'+esc(m.fornecedor||"")+'" placeholder="Ex: Loja/fornecedor X"></div>'+
+      '<div class="field"><label>Notas</label><textarea id="mtNotas" placeholder="Cor, espessura, observações...">'+esc(m.notas||"")+'</textarea></div>'+
+      '<p style="margin:-4px 0 4px; font-size:11.5px; color:var(--muted);">Preenchendo a quantidade em estoque, eu calculo o valor total investido nesse material sozinho.</p>'+
+      '<div class="modal-actions">'+
+        (m.id ? '<button class="btn btn-danger btn-sm" id="btnDelMaterial">Excluir</button>' : '<span></span>')+
+        '<span style="flex:1"></span>'+
+        '<button class="btn btn-ghost" id="btnCancel">Cancelar</button>'+
+        '<button class="btn btn-primary" id="btnSaveMaterial">Salvar</button>'+
+      '</div>';
+  }
+
+  function openMaterialForm(m){
+    openModal(materialFormHtml(m));
+    document.getElementById("btnCancel").addEventListener("click", closeModal);
+    if (m && m.id) {
+      document.getElementById("btnDelMaterial").addEventListener("click", function(){
+        docDelete("materiais", m.id).then(function(){ showToast("Material excluído."); closeModal(); });
+      });
+    }
+    document.getElementById("btnSaveMaterial").addEventListener("click", function(){
+      var data = {
+        nome: document.getElementById("mtNome").value.trim(),
+        categoria: document.getElementById("mtCategoria").value,
+        unidade: document.getElementById("mtUnidade").value.trim(),
+        custoUnitario: parseFloat(document.getElementById("mtCusto").value)||0,
+        quantidadeEstoque: parseFloat(document.getElementById("mtEstoque").value)||0,
+        fornecedor: document.getElementById("mtFornecedor").value.trim(),
+        notas: document.getElementById("mtNotas").value.trim()
+      };
+      if (!data.nome) { showToast("Coloca o nome do material."); return; }
+      if (m && m.id) {
+        docUpdate("materiais", m.id, data).then(function(){ showToast("Material atualizado."); closeModal(); });
+      } else {
+        data.criadoEm = new Date().toISOString();
+        docAdd("materiais", data).then(function(){ showToast("Material adicionado."); closeModal(); });
+      }
+    });
+  }
+
+  function bindMateriaisEvents(){
+    var btnNovo = document.getElementById("btnNovoMaterial");
+    if (btnNovo) btnNovo.addEventListener("click", function(){ openMaterialForm(null); });
+    Array.prototype.forEach.call(document.querySelectorAll('[data-action="edit-material"]'), function(row){
+      row.addEventListener("click", function(){ openMaterialForm(state.materiais.get(row.dataset.id)); });
     });
   }
 
@@ -2374,6 +2546,7 @@
         }).catch(function(err){
           console.error(err);
           document.getElementById("ocImgStatus").textContent = "Não deu pra enviar — tenta outra foto.";
+          showToast("Erro ao enviar imagem"+(err&&err.message?": "+err.message:"")+".");
         });
       });
     }
@@ -2932,6 +3105,7 @@
         }).catch(function(err){
           console.error(err);
           document.getElementById("imgUploadStatus").textContent = "Não deu pra enviar a imagem — tenta outra.";
+          showToast("Erro ao enviar imagem"+(err&&err.message?": "+err.message:"")+".");
         });
       });
     }
@@ -3021,6 +3195,8 @@
       bindCriativosEvents();
     } else if (currentTab === "produtos") {
       bindProdutosEvents();
+    } else if (currentTab === "materiais") {
+      bindMateriaisEvents();
     } else if (currentTab === "calendario") {
       var calPrev = document.getElementById("calPrev");
       var calNext = document.getElementById("calNext");
