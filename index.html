@@ -129,6 +129,25 @@
 
   .card{background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow);}
 
+  /* ---------- login ---------- */
+  .app.app-hidden{display:none;}
+  .login-gate{
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    padding:24px; background:var(--bg);
+  }
+  .login-card{
+    width:100%; max-width:340px; padding:26px 24px; display:flex; flex-direction:column; gap:16px;
+  }
+  .login-card .brand{justify-content:center;}
+  .login-card p{margin:0; font-size:13px; color:var(--muted); text-align:center;}
+  .login-card .field input{
+    border:1px solid var(--border); background:var(--surface-2); color:var(--ink);
+    border-radius:8px; padding:9px 11px; font-size:14px;
+  }
+  .login-card .field input:focus{outline:2px solid var(--accent); outline-offset:1px;}
+  .login-card .btn-primary{justify-content:center; padding:10px 14px;}
+  #loginError{font-size:12.5px; color:var(--st-quente); min-height:1.2em; text-align:center;}
+
   /* ---------- pipeline ---------- */
   .pipeline-head{display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap;}
   .board{display:grid; grid-template-columns:repeat(5, minmax(210px,1fr)); gap:12px; overflow-x:auto;}
@@ -271,7 +290,23 @@
   }
 </style>
 
-<div class="app">
+<div class="login-gate" id="loginGate" style="display:none;">
+  <div class="card login-card">
+    <div class="brand">
+      <div class="brand-mark">🪢</div>
+      <div>
+        <div class="brand-name">Stylo Fibra</div>
+        <div class="brand-sub">central de vendas</div>
+      </div>
+    </div>
+    <p>Entra com o e-mail e senha cadastrados pra acessar os dados da loja.</p>
+    <div class="field"><label>E-mail</label><input id="loginEmail" type="email" autocomplete="username" placeholder="voce@email.com"></div>
+    <div class="field"><label>Senha</label><input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••"></div>
+    <div id="loginError"></div>
+    <button class="btn btn-primary" id="btnLoginSubmit">Entrar</button>
+  </div>
+</div>
+<div class="app" id="appRoot">
   <aside class="sidebar" id="sidebarEl">
     <div class="brand">
       <div class="brand-mark">🪢</div>
@@ -289,6 +324,7 @@
       <h1 id="pageTitle">Pipeline</h1>
       <div style="display:flex; align-items:center; gap:10px;">
         <span class="conn-status" id="connStatus" style="display:none;"></span>
+        <button class="btn btn-sm btn-ghost" id="btnLogout" style="display:none;">Sair</button>
         <div class="date" id="pageDate"></div>
       </div>
     </div>
@@ -382,6 +418,7 @@
   var db = null;
   var assets = null;
   var downloadsCap = null;
+  var supaClient = null; // cliente Supabase, guardado pra login/logout
   var mode = "loading"; // loading | db | local
   var currentTab = "painel";
   var state = { leads: new Map(), campaigns: new Map(), content: new Map(), orcamentos: new Map(), criativos: new Map(), prompts: new Map(), settings: new Map(), logistica: new Map(), produtos: new Map(), materiais: new Map() };
@@ -642,15 +679,15 @@
     }
 
     if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY) {
-      // Rodando fora do Claude (ex: GitHub Pages) — usa o Supabase como backend real.
+      // Rodando fora do Claude (ex: Vercel) — usa o Supabase como backend real,
+      // escondido atrás de login: ninguém vê ou edita dados sem e-mail/senha cadastrados.
+      showLoginGate();
       try {
-        var client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-        db = makeSupabaseDb(client);
-        mode = "db";
-        COLLECTIONS.forEach(subscribeCollection);
-        assets = makeSupabaseAssets(client);
-        downloadsCap = makeBrowserDownloads();
-        render();
+        supaClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        supaClient.auth.onAuthStateChange(function(_event, session){
+          if (session) { hideLoginGate(); startAuthedApp(supaClient); }
+          else { stopAuthedApp(); showLoginGate(); }
+        });
       } catch (e) {
         console.error("Falha ao iniciar o Supabase", e);
         mode = "local";
@@ -663,10 +700,85 @@
     render();
   }
 
+  function startAuthedApp(client){
+    unsubs.forEach(function(u){ u && u(); });
+    unsubs = [];
+    db = makeSupabaseDb(client);
+    mode = "db";
+    COLLECTIONS.forEach(subscribeCollection);
+    assets = makeSupabaseAssets(client);
+    downloadsCap = makeBrowserDownloads();
+    render();
+  }
+
+  function stopAuthedApp(){
+    unsubs.forEach(function(u){ u && u(); });
+    unsubs = [];
+    db = null; assets = null; downloadsCap = null;
+    mode = "loading";
+  }
+
+  function showLoginGate(){
+    var gate = document.getElementById("loginGate");
+    var appRoot = document.getElementById("appRoot");
+    if (gate) gate.style.display = "flex";
+    if (appRoot) appRoot.classList.add("app-hidden");
+  }
+
+  function hideLoginGate(){
+    var gate = document.getElementById("loginGate");
+    var appRoot = document.getElementById("appRoot");
+    if (gate) gate.style.display = "none";
+    if (appRoot) appRoot.classList.remove("app-hidden");
+    var errEl = document.getElementById("loginError");
+    if (errEl) errEl.textContent = "";
+  }
+
+  function wireLoginForm(){
+    var btn = document.getElementById("btnLoginSubmit");
+    var pass = document.getElementById("loginPassword");
+    if (!btn || !pass) return;
+    function submit(){
+      var email = (document.getElementById("loginEmail").value || "").trim();
+      var senha = pass.value || "";
+      var errEl = document.getElementById("loginError");
+      errEl.textContent = "";
+      if (!email || !senha) { errEl.textContent = "Preenche e-mail e senha."; return; }
+      if (!supaClient) { errEl.textContent = "Sistema ainda carregando, espera um instante e tenta de novo."; return; }
+      btn.disabled = true; btn.textContent = "Entrando...";
+      supaClient.auth.signInWithPassword({ email: email, password: senha })
+        .then(function(res){
+          btn.disabled = false; btn.textContent = "Entrar";
+          if (res.error) { errEl.textContent = "E-mail ou senha incorretos."; }
+          // sucesso: onAuthStateChange já cuida de mostrar o app
+        })
+        .catch(function(){
+          btn.disabled = false; btn.textContent = "Entrar";
+          errEl.textContent = "Não deu pra entrar agora, tenta de novo.";
+        });
+    }
+    btn.addEventListener("click", submit);
+    pass.addEventListener("keydown", function(e){ if (e.key === "Enter") submit(); });
+  }
+
+  function wireLogoutButton(){
+    var btn = document.getElementById("btnLogout");
+    if (!btn) return;
+    btn.addEventListener("click", function(){
+      if (supaClient) supaClient.auth.signOut();
+    });
+  }
+
   function updateConnStatus(){
     var el = document.getElementById("connStatus");
+    var logoutBtn = document.getElementById("btnLogout");
     if (!el) return;
-    if (window.claude && window.claude.use) { el.style.display = "none"; return; } // dentro do Claude não precisa avisar
+    if (window.claude && window.claude.use) {
+      el.style.display = "none";
+      if (logoutBtn) logoutBtn.style.display = "none";
+      return; // dentro do Claude não precisa avisar
+    }
+    if (logoutBtn) logoutBtn.style.display = (mode === "db") ? "inline-flex" : "none";
     if (mode === "db") {
       el.style.display = "inline-flex";
       el.style.color = "var(--st-fechado)";
@@ -3213,6 +3325,8 @@
 
   // ---------------- boot ----------------
   bindMobileMenu();
+  wireLoginForm();
+  wireLogoutButton();
   initDb();
   render();
 })();
